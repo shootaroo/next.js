@@ -19,7 +19,6 @@ __turbopack_context__.s([]);
 const binding = 123;
 __turbopack_context__.s([
     "f",
-    0,
     binding
 ]);
 }),
