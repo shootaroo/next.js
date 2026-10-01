@@ -1,3 +1,4 @@
+import { pipeWorkerOutput } from './upgrade/output'
 import type { ChildProcess } from 'child_process'
 import { Worker as JestWorker } from 'next/dist/compiled/jest-worker'
 import { Transform } from 'stream'
@@ -220,8 +221,10 @@ export class Worker {
       this._worker.getStderr().pipe(abortActivityStreamOnLog)
 
       // Pipe the worker's stdout and stderr to the parent process
-      this._worker.getStdout().pipe(process.stdout)
-      this._worker.getStderr().pipe(process.stderr)
+      // Consume workers even while output is held; pipe backpressure would
+      // otherwise stop their work once the workload's Node buffers fill.
+      pipeWorkerOutput(this._worker.getStdout(), process.stdout)
+      pipeWorkerOutput(this._worker.getStderr(), process.stderr)
     }
     createWorker()
 

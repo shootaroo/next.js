@@ -30,6 +30,8 @@ import { initialEnv } from '@next/env'
 import { fork } from 'child_process'
 import type { ChildProcess } from 'child_process'
 import type { UpgradeContext } from '../lib/upgrade/nudge'
+import { withUpgradePromptHidden } from '../lib/upgrade/prompt'
+import { withUpgradeTemporaryOutput } from '../lib/upgrade/output'
 import {
   getReservedPortExplanation,
   isPortIsReserved,
@@ -593,17 +595,55 @@ const nextDev = async (
             })
             receivedUpgradeContext?.()
           } else if (msg.nextUpgradeOutputLimit) {
-            // Close the menu first; the next turn releases logs without painting
-            // over its screen. New workers must also start with output released.
+            // Skip the pending choice without stopping the server. Future
+            // replacement workers also start with their terminal released.
             outputHeld = false
             upgradeController?.abort()
-            setImmediate(() => {
+            void withUpgradePromptHidden(async () => {
               if (worker.connected) {
                 worker.send({ nextUpgradeContinue: true })
               }
+            }).catch((error) => {
+              console.error(error)
+              void handleSessionStop('SIGTERM')
+            })
+          } else if (msg.nextUpgradeOutput) {
+            // Awaited config writes borrow the terminal and then return it.
+            const reveal = withUpgradePromptHidden(() =>
+              withUpgradeTemporaryOutput(worker)
+            )
+            void reveal.catch((error) => {
+              console.error(error)
+              void handleSessionStop('SIGTERM')
             })
           } else if (msg.nextWorkerReady) {
-            worker.send({ nextWorkerOptions: startServerOptions })
+            if (outputHeld && upgradeOffered) {
+              // A replacement child loads config with live output. Hide the
+              // existing choice until it has corked and reported its context.
+              void withUpgradePromptHidden(
+                () =>
+                  new Promise<void>((done) => {
+                    const finish = () => {
+                      worker.off('message', onContext)
+                      worker.off('close', finish)
+                      done()
+                    }
+                    const onContext = (message: any) => {
+                      if (message?.nextUpgradeContext) {
+                        finish()
+                      }
+                    }
+                    worker.on('message', onContext)
+                    worker.once('close', finish)
+                    worker.send({ nextWorkerOptions: startServerOptions })
+                  })
+              ).catch((error) => {
+                console.error(error)
+                void handleSessionStop('SIGTERM')
+              })
+            } else {
+              worker.send({ nextWorkerOptions: startServerOptions })
+            }
           } else if (msg.nextServerReady && !resolved) {
             if (msg.port) {
               // Store the used port in case a random one was selected, so that

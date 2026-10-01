@@ -1,3 +1,4 @@
+import { pipeWorkerOutput } from '../../lib/upgrade/output'
 import type { FindComponentsResult, NodeRequestHandler } from '../next-server'
 import type { LoadComponentsReturnType } from '../load-components'
 import type { Options as ServerOptions } from '../next-server'
@@ -175,8 +176,10 @@ export default class DevServer extends Server {
       loadStaticPaths: typeof import('./static-paths-worker').loadStaticPaths
     }
 
-    worker.getStdout().pipe(process.stdout)
-    worker.getStderr().pipe(process.stderr)
+    // Static-path generation continues while output is held. Read its logs
+    // without letting the corked destination pause the worker's execution.
+    pipeWorkerOutput(worker.getStdout(), process.stdout)
+    pipeWorkerOutput(worker.getStderr(), process.stderr)
 
     return worker
   }
@@ -622,6 +625,8 @@ export default class DevServer extends Server {
         'Intercepting routes are not supported with static export.\nRead more: https://nextjs.org/docs/app/building-your-application/deploying/static-exports#unsupported-features'
       )
 
+      // Stop this validator immediately, but let the managed exit reveal the
+      // error above before process termination discards the buffered streams.
       process.exit(1)
     }
 

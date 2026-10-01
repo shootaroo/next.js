@@ -1,3 +1,4 @@
+import { withUpgradeOutput } from '../../../lib/upgrade/output'
 import path from 'path'
 import {
   getRouteRegex,
@@ -378,7 +379,9 @@ export async function createRouteTypesManifest({
 
   // Process redirects
   if (typeof redirects === 'function') {
-    const rd = await redirects()
+    // These config hooks run again during type generation, including after
+    // initial startup. Let them finish awaited writes while the menu is hidden.
+    const rd = await withUpgradeOutput(async () => redirects())
 
     for (const item of rd) {
       const possibleRoutes = convertCustomRouteSource(item.source)
@@ -393,7 +396,9 @@ export async function createRouteTypesManifest({
 
   // Process rewrites
   if (typeof rewrites === 'function') {
-    const rw = await rewrites()
+    // Like redirects, this hook may await a log write. Borrow the terminal so
+    // type generation can finish instead of waiting indefinitely on corking.
+    const rw = await withUpgradeOutput(async () => rewrites())
 
     const allSources = Array.isArray(rw)
       ? rw
