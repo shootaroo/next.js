@@ -1,4 +1,8 @@
-import { pipeWorkerOutput } from './upgrade/output'
+import {
+  exitWithUpgradeOutput,
+  pipeWorkerOutput,
+  registerUpgradeCleanup,
+} from './upgrade/output'
 import type { ChildProcess } from 'child_process'
 import { Worker as JestWorker } from 'next/dist/compiled/jest-worker'
 import { Transform } from 'stream'
@@ -31,6 +35,7 @@ export function getNextBuildDebuggerPortOffset(_: {
 }
 
 export class Worker {
+  private readonly unregisterUpgradeCleanup: () => void
   private _worker: JestWorker | undefined
 
   private _onActivity: (() => void) | undefined
@@ -82,6 +87,13 @@ export class Worker {
     let activeTasks = 0
 
     this._worker = undefined
+    // Controlled workload exits must finish workers before flushing held logs.
+    // The ordinary synchronous exit listener below remains the final fallback.
+    this.unregisterUpgradeCleanup = registerUpgradeCleanup(async () => {
+      if (this._worker) {
+        await this.end()
+      }
+    })
 
     // ensure we end workers if they weren't before exit
     process.on('exit', () => {
@@ -182,7 +194,7 @@ export class Worker {
               )
 
               // if a child process doesn't exit gracefully, we want to bubble up the exit code to the parent process
-              process.exit(code ?? 1)
+              void exitWithUpgradeOutput(code ?? 1)
             }
           })
 
@@ -221,8 +233,8 @@ export class Worker {
       this._worker.getStderr().pipe(abortActivityStreamOnLog)
 
       // Pipe the worker's stdout and stderr to the parent process
-      // Consume workers even while output is held; pipe backpressure would
-      // otherwise stop their work once the workload's Node buffers fill.
+      // Worker logs join this process's corked streams. Keep reading them so
+      // the workers do not stall just because the menu owns terminal output.
       pipeWorkerOutput(this._worker.getStdout(), process.stdout)
       pipeWorkerOutput(this._worker.getStderr(), process.stderr)
     }
@@ -296,6 +308,7 @@ export class Worker {
   }
 
   end(): ReturnType<JestWorker['end']> {
+    this.unregisterUpgradeCleanup()
     const worker = this._worker
     if (!worker) {
       throw new Error('Farm is ended, no more calls can be done to it')
@@ -309,6 +322,7 @@ export class Worker {
    * Quietly end the worker if it exists
    */
   close(): void {
+    this.unregisterUpgradeCleanup()
     if (this._worker) {
       cleanupWorkers(this._worker)
       this._worker.end()

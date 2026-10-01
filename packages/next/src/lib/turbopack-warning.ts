@@ -1,4 +1,4 @@
-import { withUpgradeOutput } from './upgrade/output'
+import { exitWithUpgradeOutput, withUpgradeOutput } from './upgrade/output'
 import type { NextConfigComplete } from '../server/config-shared'
 import loadConfig from '../server/config'
 import * as Log from '../build/output/log'
@@ -166,7 +166,7 @@ export async function validateTurboNextConfig({
    empty turbopack config in ${configFile} (e.g. \`turbopack: {}\`).`
     )
 
-    process.exit(1)
+    await exitWithUpgradeOutput(1)
   }
 
   if (unsupportedConfig.length) {

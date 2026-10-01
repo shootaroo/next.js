@@ -1,4 +1,7 @@
-import { handleUpgradeOutputMessages } from '../../lib/upgrade/output'
+import {
+  exitWithUpgradeOutput,
+  handleUpgradeOutputMessages,
+} from '../../lib/upgrade/output'
 // Start CPU profile if it wasn't already started.
 import './cpu-profile'
 import { getNetworkHost } from '../../lib/get-network-host'
@@ -269,7 +272,7 @@ export async function startServer(
           'memory.heapUsed': String(memoryRestartStats.used_heap_size),
         }).stop()
         flushAllTraces()
-        process.exit(RESTART_EXIT_CODE)
+        await exitWithUpgradeOutput(RESTART_EXIT_CODE)
       }
     }
   }
@@ -314,7 +317,7 @@ export async function startServer(
     } else {
       Log.error(`Failed to start server`)
       console.error(err)
-      process.exit(1)
+      void exitWithUpgradeOutput(1)
     }
   })
 
@@ -467,16 +470,16 @@ export async function startServer(
             // This avoids waiting for the debugger to disconnect.
             switch (signal) {
               case 'SIGINT':
-                process.exit(130)
+                await exitWithUpgradeOutput(130)
                 break
               case 'SIGTERM':
-                process.exit(143)
+                await exitWithUpgradeOutput(143)
                 break
               default:
                 // Make sure all handled signals have explicit exit codes.
                 // This is just a fallback to guard against unsound types.
                 signal satisfies never
-                process.exit(128)
+                await exitWithUpgradeOutput(128)
             }
           })()
         }
@@ -563,7 +566,7 @@ export async function startServer(
         // fatal error if we can't setup
         handlersError()
         console.error(err)
-        process.exit(1)
+        await exitWithUpgradeOutput(1)
       }
     })
     server.listen(port, hostname)
@@ -609,7 +612,7 @@ export async function startServer(
           filename
         )}. Restarting the server to apply the changes...`
       )
-      process.exit(RESTART_EXIT_CODE)
+      void exitWithUpgradeOutput(RESTART_EXIT_CODE)
     })
     wp.on('remove', (removedPath: string) => {
       if (dirWatchPaths.includes(removedPath)) {
@@ -620,7 +623,7 @@ export async function startServer(
             'Deleting this directory while Next.js is running can lead to ' +
             'undefined behavior. Restarting the server to recover...'
         )
-        process.exit(RESTART_EXIT_CODE)
+        void exitWithUpgradeOutput(RESTART_EXIT_CODE)
       }
     })
   }
@@ -629,8 +632,14 @@ export async function startServer(
 }
 
 if (process.env.NEXT_PRIVATE_WORKER && process.send) {
-  // Install IPC before config loads; the router holds output only after config.
-  if (process.env.NEXT_PRIVATE_UPGRADE_PROMPT === '1') {
+  // Keep shutdown control across restarts after Skip as well. Config and its
+  // route callbacks stay live; router-server decides whether to hold output.
+  // Install IPC before loading config so even startup errors can ask the parent
+  // to hide the menu and flush their buffered diagnostics before exiting.
+  if (
+    process.env.NEXT_PRIVATE_UPGRADE_PROCESS_GROUP === '1' ||
+    process.env.NEXT_PRIVATE_UPGRADE_PROMPT === '1'
+  ) {
     handleUpgradeOutputMessages()
   }
 

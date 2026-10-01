@@ -1,3 +1,4 @@
+import { exitWithUpgradeOutput } from '../../lib/upgrade/output'
 import type { Socket } from 'net'
 import { mkdir, writeFile } from 'fs/promises'
 import { realpathSync } from 'fs'
@@ -2213,7 +2214,9 @@ export async function createHotReloaderTurbopack(
 
   handleEntrypointsSubscription().catch((err) => {
     console.error(err)
-    process.exit(1)
+    // A fatal subscription error may be buffered behind the upgrade choice.
+    // Restore output before terminating the dev process.
+    void exitWithUpgradeOutput(1)
   })
 
   // Write empty manifests
@@ -2330,7 +2333,9 @@ export async function createHotReloaderTurbopack(
 
   handleProjectUpdates().catch((err) => {
     console.error(err)
-    process.exit(1)
+    // Use the same controlled exit so this subscription's error is not lost
+    // when the menu has corked the dev process's streams.
+    void exitWithUpgradeOutput(1)
   })
 
   if (lazyDynamicImportsSSR) {

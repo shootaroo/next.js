@@ -1,4 +1,4 @@
-import { pipeWorkerOutput } from '../../lib/upgrade/output'
+import { throwUpgradeError, pipeWorkerOutput } from '../../lib/upgrade/output'
 import type { FindComponentsResult, NodeRequestHandler } from '../next-server'
 import type { LoadComponentsReturnType } from '../load-components'
 import type { Options as ServerOptions } from '../next-server'
@@ -627,7 +627,9 @@ export default class DevServer extends Server {
 
       // Stop this validator immediately, but let the managed exit reveal the
       // error above before process termination discards the buffered streams.
-      process.exit(1)
+      throwUpgradeError(
+        'Intercepting routes are not supported with static export'
+      )
     }
 
     return rewrites ?? []
