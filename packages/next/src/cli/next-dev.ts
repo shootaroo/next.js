@@ -34,6 +34,7 @@ import { withUpgradePromptHidden } from '../lib/upgrade/prompt'
 import {
   forwardUpgradeResize,
   killUpgradeWork,
+  restoreUpgradeEnvironment,
   signalUpgradeWork,
   withUpgradeTemporaryOutput,
 } from '../lib/upgrade/output'
@@ -88,6 +89,7 @@ let interruption: NodeJS.Signals | null = null
 // state separate so later restarts and signals still clean up managed workers.
 let outputHeld = false
 let managedDev = false
+let upgradeEnvironment: Record<string, string | null> | null = null
 
 // The server can exit before the user chooses. Retain its result while the
 // parent keeps the choice alive, then exit with that result if the user skips.
@@ -400,6 +402,7 @@ const nextDev = async (
       process.off('SIGTERM', onTerminate)
       process.off('SIGHUP', onHangup)
       process.off('SIGQUIT', onQuit)
+      restoreUpgradeEnvironment(upgradeEnvironment)
       process.exit(
         await runUpgrade(dir, context.experimental.agentUpgrade, nudgeId)
       )
@@ -702,6 +705,9 @@ const nextDev = async (
           ) {
             allowedUpgradeRetries.add(msg.nextUpgradeRetryAllowed)
           } else if (msg.nextUpgradeContext) {
+            // Replacement workers can reload config while the choice is open.
+            // Keep the latest environment for handoff without mutating the CLI.
+            upgradeEnvironment = msg.nextUpgradeEnvironment ?? null
             const context = msg.nextUpgradeContext as UpgradeContext
             distDir = context.distDir
             if (upgradeOffered) {

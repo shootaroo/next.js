@@ -1,5 +1,6 @@
 import type { Writable } from 'stream'
 import { spawnSync, type ChildProcess } from 'child_process'
+import { updateInitialEnv } from '@next/env'
 
 // The parent owns the menu; the work process keeps its real TTY and buffers
 // writes in its own stdout/stderr. IPC carries permission to print, not logs.
@@ -159,6 +160,46 @@ export function withUpgradeTemporaryOutput(child: ChildProcess) {
       }
     )
   })
+}
+
+export function getUpgradeEnvironment(
+  initialEnvironment: Record<string, string | undefined>
+) {
+  // Compare only around config loading or a user callback. Taking the snapshot
+  // at worker startup would also forward server ports and other runtime state.
+  // Null represents a deletion because IPC drops undefined object values.
+  const environment: Record<string, string | null> = {}
+  for (const key of new Set([
+    ...Object.keys(initialEnvironment),
+    ...Object.keys(process.env),
+  ])) {
+    // This flag belongs to @next/env's cache. The upgrade and its subprocesses
+    // must still be able to load their own env files.
+    if (
+      key !== '__NEXT_PROCESSED_ENV' &&
+      initialEnvironment[key] !== process.env[key]
+    ) {
+      environment[key] = process.env[key] ?? null
+    }
+  }
+  return environment
+}
+
+export function restoreUpgradeEnvironment(
+  environment: Record<string, string | null> | null
+) {
+  // Apply config and .env changes only at handoff, including deletions and
+  // the cache used by future env loads in the upgrade process.
+  const restoredEnvironment: Record<string, string | undefined> = {}
+  for (const [key, value] of Object.entries(environment ?? {})) {
+    if (value === null) {
+      delete process.env[key]
+    } else {
+      process.env[key] = value
+    }
+    restoredEnvironment[key] = value ?? undefined
+  }
+  updateInitialEnv(restoredEnvironment)
 }
 
 export function corkUpgradeOutput() {
