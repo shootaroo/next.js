@@ -162,6 +162,14 @@ export function withUpgradeTemporaryOutput(child: ChildProcess) {
   })
 }
 
+export function isUpgradeOutputCorked() {
+  return corked
+}
+
+export function isUpgradeOutputManaged() {
+  return managed
+}
+
 export function getUpgradeEnvironment(
   initialEnvironment: Record<string, string | undefined>
 ) {

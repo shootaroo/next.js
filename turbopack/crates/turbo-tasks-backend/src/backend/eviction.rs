@@ -107,9 +107,12 @@ impl EvictionControl {
                     match num.trim().parse::<usize>() {
                         Ok(n) => Some(n * mult),
                         Err(e) => {
-                            eprintln!(
-                                "error: could not parse `TURBO_ENGINE_EVICT_MIN_BYTES` value: \
-                                 {e:?}"
+                            turbo_tasks::terminal_output::print_terminal_output(
+                                2,
+                                format_args!(
+                                    "error: could not parse `TURBO_ENGINE_EVICT_MIN_BYTES` value: \
+                                     {e:?}"
+                                ),
                             );
                             None
                         }

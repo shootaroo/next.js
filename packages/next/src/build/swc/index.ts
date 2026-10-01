@@ -682,12 +682,17 @@ function bindingToApi(
 
   class ProjectImpl implements Project {
     private readonly _nativeProject: { __napiType: 'Project' }
+    private shutdownPromise: Promise<void> | null = null
+    private readonly unregisterUpgradeCleanup: () => void
 
     constructor(
       nativeProject: { __napiType: 'Project' },
       private readonly projectPath: string
     ) {
       this._nativeProject = nativeProject
+      this.unregisterUpgradeCleanup = (
+        require('../../lib/upgrade/output') as typeof import('../../lib/upgrade/output')
+      ).registerUpgradeCleanup(() => this.shutdown())
 
       if (typeof binding.registerWorkerScheduler === 'function') {
         runLoaderWorkerPool(binding, bindingPath)
@@ -850,10 +855,22 @@ function bindingToApi(
     }
 
     shutdown(): Promise<void> {
-      return binding.projectShutdown(this._nativeProject)
+      // Normal completion and an upgrade interruption can race. Native exit
+      // handlers are one-shot, so both callers must await the same shutdown.
+      this.shutdownPromise ??= binding
+        .projectShutdown(this._nativeProject)
+        .finally(this.unregisterUpgradeCleanup)
+      return this.shutdownPromise
     }
 
     onExit(): Promise<void> {
+      if (
+        (
+          require('../../lib/upgrade/output') as typeof import('../../lib/upgrade/output')
+        ).isUpgradeOutputManaged()
+      ) {
+        return this.shutdown()
+      }
       return binding.projectOnExit(this._nativeProject)
     }
   }
@@ -1307,6 +1324,19 @@ function bindingToApi(
           require('../../shared/lib/turbopack/internal-error') as typeof import('../../shared/lib/turbopack/internal-error')
         ).throwTurbopackInternalError,
         onBeforeDeferredEntries: callbacks?.onBeforeDeferredEntries,
+        // Native diagnostics join this child's stream queues. Returning from this
+        // callback acknowledges acceptance, never terminal display or drain.
+        onOutput: (
+          require('../../lib/upgrade/output') as typeof import('../../lib/upgrade/output')
+        ).isUpgradeOutputManaged()
+          ? (error: Error | null, output: { fd: number; data: Buffer }) => {
+              if (error) {
+                throw error
+              }
+              const stream = output.fd === 1 ? process.stdout : process.stderr
+              stream.write(output.data)
+            }
+          : undefined,
       }
     )
     return {

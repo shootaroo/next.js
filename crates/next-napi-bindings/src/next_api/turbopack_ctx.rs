@@ -5,15 +5,18 @@ use std::{
     fs::OpenOptions,
     io::{self, BufRead, Write},
     path::PathBuf,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use napi::{
     Env, Status, Unknown,
-    bindgen_prelude::{FunctionRef, Promise},
-    threadsafe_function::ThreadsafeFunction,
+    bindgen_prelude::{Buffer, FunctionRef, Promise},
+    threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode},
 };
 use napi_derive::napi;
 use owo_colors::OwoColorize;
@@ -23,6 +26,7 @@ use turbo_tasks::{
     PrettyPrintError, TurboTasks, TurboTasksCallApi,
     backend::TurboTasksExecutionError,
     message_queue::{CompilationEvent, Severity},
+    terminal_output::{TerminalOutput, with_terminal_output},
 };
 use turbo_tasks_backend::{
     BackendOptions, BackingStorageOptions, EvictionMode, GitVersionInfo, StartupCacheState,
@@ -94,7 +98,9 @@ impl NextTurbopackContext {
                 None
             };
 
-        log_internal_error_and_inform(err);
+        with_terminal_output(self.inner.napi_callbacks.terminal_output.clone(), || {
+            log_internal_error_and_inform(err);
+        });
 
         async move {
             this.inner
@@ -125,6 +131,10 @@ impl NextTurbopackContext {
         async move { Err(err_fut.await) }
     }
 
+    pub async fn drain_terminal_output(&self) -> napi::Result<()> {
+        self.inner.napi_callbacks.drain_terminal_output().await
+    }
+
     /// Calls the `onBeforeDeferredEntries` callback in Node.js if one was provided.
     pub async fn on_before_deferred_entries(&self) -> napi::Result<()> {
         if let Some(callback) = &self.inner.napi_callbacks.on_before_deferred_entries {
@@ -153,6 +163,23 @@ pub struct NapiNextTurbopackCallbacksJsObject {
     /// Called before deferred entries are processed in a production build.
     #[napi(ts_type = "() => Promise<void>")]
     pub on_before_deferred_entries: Option<FunctionRef<(), Promise<()>>>,
+
+    /// Receives terminal bytes on the owning JavaScript thread.
+    #[napi(ts_type = "(error: Error | null, output: NapiTerminalOutput) => void")]
+    pub on_output: Option<FunctionRef<NapiTerminalOutput, ()>>,
+}
+
+#[napi(object)]
+pub struct NapiTerminalOutput {
+    pub fd: u8,
+    pub data: Buffer,
+}
+
+#[derive(Default)]
+struct OutputDelivery {
+    pending: AtomicUsize,
+    ready: tokio::sync::Notify,
+    error: Mutex<Option<String>>,
 }
 
 /// A collection of helper JavaScript functions passed into
@@ -160,6 +187,8 @@ pub struct NapiNextTurbopackCallbacksJsObject {
 ///
 /// This type is [`Send`] and [`Sync`]. Callbacks are wrapped in [`ThreadsafeFunction`].
 pub struct NapiNextTurbopackCallbacks {
+    pub terminal_output: Option<TerminalOutput>,
+    output_delivery: Arc<OutputDelivery>,
     // It's a little nasty to use a `ThreadsafeFunction` for this, but we don't expect exceptions
     // to be a hot codepath.
     //
@@ -199,6 +228,27 @@ pub struct TurbopackInternalErrorOpts {
 }
 
 impl NapiNextTurbopackCallbacks {
+    // Retain delivery state independently of a project so initialization errors
+    // can also wait for queued JavaScript callbacks before rejecting.
+    pub fn drain_terminal_output(&self) -> impl Future<Output = napi::Result<()>> + use<> {
+        let delivery = self.output_delivery.clone();
+        async move {
+            loop {
+                let ready = delivery.ready.notified();
+                tokio::pin!(ready);
+                ready.as_mut().enable();
+                if delivery.pending.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                ready.await;
+            }
+            if let Some(error) = delivery.error.lock().unwrap().take() {
+                return Err(napi::Error::from_reason(error));
+            }
+            Ok(())
+        }
+    }
+
     pub fn from_js(env: &Env, obj: NapiNextTurbopackCallbacksJsObject) -> napi::Result<Self> {
         let throw_turbopack_internal_error = obj
             .throw_turbopack_internal_error
@@ -226,7 +276,59 @@ impl NapiNextTurbopackCallbacks {
             })
             .transpose()?;
 
+        // Queueing must not block the JS thread, including synchronous project
+        // initialization. Count completed callbacks separately from terminal flush.
+        let output_delivery = Arc::new(OutputDelivery::default());
+        let terminal_output = obj
+            .on_output
+            .map(|callback| {
+                let callback: ThreadsafeFunction<
+                    (u8, Vec<u8>),
+                    (),
+                    NapiTerminalOutput,
+                    Status,
+                    true,
+                    true,
+                > = callback
+                    .borrow_back(env)?
+                    .build_threadsafe_function::<(u8, Vec<u8>)>()
+                    .callee_handled::<true>()
+                    .weak::<true>()
+                    .build_callback(|ctx| {
+                        Ok(NapiTerminalOutput {
+                            fd: ctx.value.0,
+                            data: ctx.value.1.into(),
+                        })
+                    })?;
+                let delivery = output_delivery.clone();
+                Ok::<TerminalOutput, napi::Error>(Arc::new(move |fd, bytes| {
+                    delivery.pending.fetch_add(1, Ordering::AcqRel);
+                    let completed = delivery.clone();
+                    let status = callback.call_with_return_value(
+                        Ok((fd, bytes)),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                        move |result, _env| {
+                            if let Err(error) = result {
+                                *completed.error.lock().unwrap() = Some(error.to_string());
+                            }
+                            completed.pending.fetch_sub(1, Ordering::AcqRel);
+                            completed.ready.notify_waiters();
+                            Ok(())
+                        },
+                    );
+                    if status != Status::Ok {
+                        delivery.pending.fetch_sub(1, Ordering::AcqRel);
+                        delivery.ready.notify_waiters();
+                        anyhow::bail!("Failed to queue terminal output: {status}");
+                    }
+                    Ok(())
+                }))
+            })
+            .transpose()?;
+
         Ok(NapiNextTurbopackCallbacks {
+            terminal_output,
+            output_delivery,
             throw_turbopack_internal_error,
             on_before_deferred_entries,
         })
@@ -430,10 +532,13 @@ pub fn log_internal_error_and_inform(internal_error: &anyhow::Error) {
         // Next's run-tests unsets CI and sets NEXT_TEST_CI
         || env::var("NEXT_TEST_CI").is_ok_and(|v| !v.is_empty())
     {
-        eprintln!(
-            "{}: An unexpected Turbopack error occurred:\n{}",
-            "FATAL".red().bold(),
-            PrettyPrintError(internal_error)
+        turbo_tasks::terminal_output::print_terminal_output(
+            2,
+            format_args!(
+                "{}: An unexpected Turbopack error occurred:\n{}",
+                "FATAL".red().bold(),
+                PrettyPrintError(internal_error)
+            ),
         );
         return;
     }
@@ -520,11 +625,14 @@ pub fn log_internal_error_and_inform(internal_error: &anyhow::Error) {
         format!("clicking here: {}", bug_report_url)
     };
 
-    eprintln!(
-        "\n-----\n{}: An unexpected Turbopack error occurred. A panic log has been written to \
-         {}.\n\nTo help make Turbopack better, report this error by {}\n-----\n",
-        "FATAL".red().bold(),
-        PANIC_LOG.to_string_lossy(),
-        bug_report_message
+    turbo_tasks::terminal_output::print_terminal_output(
+        2,
+        format_args!(
+            "\n-----\n{}: An unexpected Turbopack error occurred. A panic log has been written to \
+             {}.\n\nTo help make Turbopack better, report this error by {}\n-----\n",
+            "FATAL".red().bold(),
+            PANIC_LOG.to_string_lossy(),
+            bug_report_message
+        ),
     );
 }

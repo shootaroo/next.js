@@ -353,6 +353,8 @@ export interface NapiNextTurbopackCallbacksJsObject {
   ) => never
   /** Called before deferred entries are processed in a production build. */
   onBeforeDeferredEntries?: () => Promise<void>
+  /** Receives terminal bytes on the owning JavaScript thread. */
+  onOutput?: (error: Error | null, output: NapiTerminalOutput) => void
 }
 
 export interface NapiOptionEnvVar {
@@ -503,6 +505,11 @@ export interface NapiSourcePos {
   column: number
 }
 
+export interface NapiTerminalOutput {
+  fd: number
+  data: Buffer
+}
+
 export interface NapiTurboEngineOptions {
   /** Track dependencies between tasks. If false, any change during build will error. */
   dependencyTracking?: boolean
@@ -518,6 +525,10 @@ export interface NapiTurboEngineOptions {
   gc?: NapiTurbopackGcOptions
 }
 
+/**
+ * Tuning for Turbopack's reference-counting GC, mirroring the
+ * `experimental.turbopackGc` config option.
+ */
 export interface NapiTurbopackGcOptions {
   /** How long a GC pass runs before it will honour an interrupt, in milliseconds. */
   minProgressMs?: number

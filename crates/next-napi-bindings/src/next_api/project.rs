@@ -430,6 +430,7 @@ pub fn project_new<'env>(
     napi_callbacks: NapiNextTurbopackCallbacksJsObject,
 ) -> napi::Result<PromiseRaw<'env, TurbopackResult<NapiProject>>> {
     let napi_callbacks = NapiNextTurbopackCallbacks::from_js(env, napi_callbacks)?;
+    let output = napi_callbacks.terminal_output.clone();
     let (exit, exit_receiver) = ExitHandler::new_receiver();
 
     // The root path must be canonicalized before DiskFileSystem is constructed, but do it early,
@@ -494,9 +495,18 @@ pub fn project_new<'env>(
             .parent()
             .expect("Trace file path must have a parent directory");
 
-        println!("Turbopack tracing enabled with targets: {trace}");
-        println!("  Note that this might have a small performance impact.");
-        println!("  Trace output will be written to {}", trace_file.display());
+        // Tracing starts before the engine owns its output sink. Route these
+        // banners through the same stream buffers so they cannot overwrite a menu.
+        turbo_tasks::terminal_output::with_terminal_output(output.clone(), || {
+            turbo_tasks::terminal_output::print_terminal_output(
+                1,
+                format_args!(
+                    "Turbopack tracing enabled with targets: {trace}\n  Note that this might have \
+                     a small performance impact.\n  Trace output will be written to {}",
+                    trace_file.display()
+                ),
+            );
+        });
 
         trace = trace
             .split(",")
@@ -571,28 +581,41 @@ pub fn project_new<'env>(
             thread::spawn(move || {
                 turbopack_trace_server::start_turbopack_trace_server(trace_file, None);
             });
-            println!("Turbopack trace server started. View trace at https://trace.nextjs.org");
+            // The trace-server banner also runs before engine initialization.
+            turbo_tasks::terminal_output::with_terminal_output(output.clone(), || {
+                turbo_tasks::terminal_output::print_terminal_output(
+                    1,
+                    format_args!(
+                        "Turbopack trace server started. View trace at https://trace.nextjs.org"
+                    ),
+                );
+            });
         }
 
         subscriber.init();
     }
 
+    // A failed project has no shutdown hook. Keep its delivery barrier alive
+    // until startup diagnostics have reached JavaScript, then reject creation.
+    let drain_output = napi_callbacks.drain_terminal_output();
     env.spawn_future(
         async move {
             let dependency_tracking = turbo_engine_options.dependency_tracking.unwrap_or(true);
-            let turbo_tasks = create_turbo_tasks(
-                PathBuf::from(&options.dist_dir),
-                &options.next_version,
-                options.is_persistent_caching_enabled,
-                dependency_tracking,
-                BackingStorageOptions {
-                    is_ci: turbo_engine_options.is_ci.unwrap_or(false),
-                    is_short_session: turbo_engine_options.is_short_session.unwrap_or(false),
-                    skip_compaction: turbo_engine_options.skip_compaction.unwrap_or(false),
-                },
-                turbo_engine_options.turbopack_memory_eviction,
-                turbo_engine_options.gc,
-            )?;
+            let turbo_tasks = turbo_tasks::terminal_output::with_terminal_output(output, || {
+                create_turbo_tasks(
+                    PathBuf::from(&options.dist_dir),
+                    &options.next_version,
+                    options.is_persistent_caching_enabled,
+                    dependency_tracking,
+                    BackingStorageOptions {
+                        is_ci: turbo_engine_options.is_ci.unwrap_or(false),
+                        is_short_session: turbo_engine_options.is_short_session.unwrap_or(false),
+                        skip_compaction: turbo_engine_options.skip_compaction.unwrap_or(false),
+                    },
+                    turbo_engine_options.turbopack_memory_eviction,
+                    turbo_engine_options.gc,
+                )
+            })?;
             let turbopack_ctx = NextTurbopackContext::new(turbo_tasks.clone(), napi_callbacks);
 
             if let Some(stats_path) = std::env::var_os("NEXT_TURBOPACK_TASK_STATISTICS") {
@@ -632,6 +655,7 @@ pub fn project_new<'env>(
                     let tt = turbo_tasks.clone();
                     let root_path = root_path.clone();
                     async move {
+                        let output = tt.terminal_output();
                         let result = tt
                             .clone()
                             .run(async move {
@@ -655,7 +679,12 @@ pub fn project_new<'env>(
                         if let Err(err) = result {
                             // TODO Not ideal to print directly to stdout.
                             // We should use a compilation event instead to report async errors.
-                            println!("Failed to benchmark file I/O: {err}");
+                            turbo_tasks::terminal_output::with_terminal_output(output, || {
+                                turbo_tasks::terminal_output::print_terminal_output(
+                                    1,
+                                    format_args!("Failed to benchmark file I/O: {err}"),
+                                );
+                            });
                         }
                     }
                     .instrument(tracing::info_span!("benchmark file I/O"))
@@ -677,7 +706,15 @@ pub fn project_new<'env>(
                     .collect(),
             })
         }
-        .instrument(tracing::info_span!("create project")),
+        .instrument(tracing::info_span!("create project"))
+        .or_else(|error| async move {
+            if let Err(drain_error) = drain_output.await {
+                return Err(napi::Error::from_reason(format!(
+                    "{error}\nFailed to deliver startup output: {drain_error}"
+                )));
+            }
+            Err(error)
+        }),
     )
 }
 
@@ -817,6 +854,7 @@ pub async fn project_on_exit(
     #[napi(ts_arg_type = "{ __napiType: \"Project\" }")] project: &External<ProjectInstance>,
 ) -> napi::Result<()> {
     run_exit_handlers(&project.exit_receiver).await;
+    project.turbopack_ctx.drain_terminal_output().await?;
     Ok(())
 }
 
@@ -849,6 +887,7 @@ pub async fn project_shutdown(
     let tt = project.turbopack_ctx.turbo_tasks();
     tt.stop_and_wait().await;
     run_exit_handlers(&project.exit_receiver).await;
+    project.turbopack_ctx.drain_terminal_output().await?;
     Ok(())
 }
 
@@ -2340,7 +2379,15 @@ pub fn project_update_info_subscribe(
 
                 if !matches!(status, Status::Ok) {
                     let error = anyhow!("Error calling JS function: {}", status);
-                    eprintln!("{error}");
+                    turbo_tasks::terminal_output::with_terminal_output(
+                        tt.terminal_output(),
+                        || {
+                            turbo_tasks::terminal_output::print_terminal_output(
+                                2,
+                                format_args!("{error}"),
+                            );
+                        },
+                    );
                     break;
                 }
             }

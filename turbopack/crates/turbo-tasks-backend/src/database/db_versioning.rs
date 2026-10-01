@@ -58,23 +58,32 @@ pub fn handle_db_versioning(
     let ignore_dirty = env::var("TURBO_ENGINE_IGNORE_DIRTY").ok().is_some();
     let disabled_versioning = env::var("TURBO_ENGINE_DISABLE_VERSIONING").ok().is_some();
     let version = if disabled_versioning {
-        println!(
-            "WARNING: File System Cache versioning is disabled. Manual removal of the filesystem \
-             caching database might be required."
+        turbo_tasks::terminal_output::print_terminal_output(
+            1,
+            format_args!(
+                "WARNING: File System Cache versioning is disabled. Manual removal of the \
+                 filesystem caching database might be required."
+            ),
         );
         Some("unversioned")
     } else if !version_info.dirty {
         Some(version_info.describe)
     } else if ignore_dirty {
-        println!(
-            "WARNING: The git repository is dirty, but File System Cache is still enabled. Manual \
-             removal of the filesystem cache database might be required."
+        turbo_tasks::terminal_output::print_terminal_output(
+            1,
+            format_args!(
+                "WARNING: The git repository is dirty, but File System Cache is still enabled. \
+                 Manual removal of the filesystem cache database might be required."
+            ),
         );
         Some(version_info.describe)
     } else {
-        println!(
-            "WARNING: The git repository is dirty: File System Cache is disabled. Use \
-             TURBO_ENGINE_IGNORE_DIRTY=1 to ignore dirtiness of the repository."
+        turbo_tasks::terminal_output::print_terminal_output(
+            1,
+            format_args!(
+                "WARNING: The git repository is dirty: File System Cache is disabled. Use \
+                 TURBO_ENGINE_IGNORE_DIRTY=1 to ignore dirtiness of the repository."
+            ),
         );
         None
     };
@@ -177,9 +186,12 @@ fn other_db_version_ttl() -> Duration {
     match raw.trim().parse::<u64>() {
         Ok(days) => ttl_from_days(days),
         Err(_) => {
-            eprintln!(
-                "WARNING: Ignoring TURBO_ENGINE_VERSION_TTL_DAYS={raw:?}, expected a whole number \
-                 of days."
+            turbo_tasks::terminal_output::print_terminal_output(
+                2,
+                format_args!(
+                    "WARNING: Ignoring TURBO_ENGINE_VERSION_TTL_DAYS={raw:?}, expected a whole \
+                     number of days."
+                ),
             );
             ttl_from_days(DEFAULT_OTHER_DB_VERSION_TTL_DAYS)
         }

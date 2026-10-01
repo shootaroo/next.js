@@ -330,10 +330,13 @@ impl TurboTasksBackend {
             && options.storage_mode == Some(StorageMode::ReadWrite)
             && options.eviction_mode == EvictionMode::Off
         {
-            eprintln!(
-                "warning: GC is enabled but eviction is disabled; GC would leave collected tasks \
-                 resident forever. Forcing GC off. Enable eviction ('auto'/'full') to use GC in \
-                 this mode."
+            turbo_tasks::terminal_output::print_terminal_output(
+                2,
+                format_args!(
+                    "warning: GC is enabled but eviction is disabled; GC would leave collected \
+                     tasks resident forever. Forcing GC off. Enable eviction ('auto'/'full') to \
+                     use GC in this mode."
+                ),
             );
             gc_enabled = false;
         }
@@ -1665,11 +1668,17 @@ impl TurboTasksBackend {
             && let Err(err) =
                 self.snapshot_and_persist(Span::current().into(), SnapshotReason::Stop, turbo_tasks)
         {
-            eprintln!("Persisting failed during shutdown: {err:?}");
+            turbo_tasks::terminal_output::print_terminal_output(
+                2,
+                format_args!("Persisting failed during shutdown: {err:?}"),
+            );
         }
         self.storage.drop_contents();
         if let Err(err) = self.backing_storage.shutdown() {
-            println!("Shutting down failed: {err}");
+            turbo_tasks::terminal_output::print_terminal_output(
+                1,
+                format_args!("Shutting down failed: {err}"),
+            );
         }
     }
 
@@ -2975,9 +2984,12 @@ impl TurboTasksBackend {
     /// Prints the standard message emitted when the background persisting process stops due to an
     /// unrecoverable write error. The caller is responsible for returning from the background job.
     fn log_unrecoverable_persist_error() {
-        eprintln!(
-            "Persisting is disabled for this session due to an unrecoverable error. Stopping the \
-             background persisting process."
+        turbo_tasks::terminal_output::print_terminal_output(
+            2,
+            format_args!(
+                "Persisting is disabled for this session due to an unrecoverable error. Stopping \
+                 the background persisting process."
+            ),
         );
     }
 
@@ -3116,7 +3128,10 @@ impl TurboTasksBackend {
                             Err(err) => {
                                 // save_snapshot consumed persisted_task_cache_log entries;
                                 // further snapshots would corrupt the task graph.
-                                eprintln!("Persisting failed: {err:?}");
+                                turbo_tasks::terminal_output::print_terminal_output(
+                                    2,
+                                    format_args!("Persisting failed: {err:?}"),
+                                );
                                 Self::log_unrecoverable_persist_error();
                                 return;
                             }
@@ -3209,7 +3224,10 @@ impl TurboTasksBackend {
                                         }
                                         Ok(None) => break,
                                         Err(err) => {
-                                            eprintln!("Compaction failed: {err:?}");
+                                            turbo_tasks::terminal_output::print_terminal_output(
+                                                2,
+                                                format_args!("Compaction failed: {err:?}"),
+                                            );
                                             if self.backing_storage.has_unrecoverable_write_error()
                                             {
                                                 Self::log_unrecoverable_persist_error();
