@@ -1,6 +1,7 @@
 import { yellow } from '../picocolors'
 import spawn from 'next/dist/compiled/cross-spawn'
 import type { PackageManager } from './get-pkg-manager'
+import { isUpgradeOutputManaged, pipeWorkerOutput } from '../upgrade/output'
 
 interface InstallArgs {
   /**
@@ -58,15 +59,21 @@ export function install(
     }
   }
 
-  return new Promise((resolve, reject) => {
-    /**
-     * Spawn the installation process.
-     */
+  return new Promise<void>((resolve, reject) => {
+    // Managed installs write through the workload's streams so the prompt can
+    // stay visible. Ordinary installs keep their existing terminal behavior.
+    const captureOutput = isUpgradeOutputManaged()
+    // Automatic installs normally need no input. Keep stdin unavailable while
+    // the menu owns it; install scripts requiring input are not supported here,
+    // even after Skip, since the running install keeps its original stdio.
     const child = spawn(packageManager, args, {
       cwd: root,
-      stdio: 'inherit',
+      stdio: captureOutput ? ['ignore', 'pipe', 'pipe'] : 'inherit',
       env: {
         ...process.env,
+        ...(captureOutput && process.stdout.isTTY
+          ? { FORCE_COLOR: process.env.FORCE_COLOR ?? '1', NO_COLOR: undefined }
+          : {}),
         ADBLOCK: '1',
         // we set NODE_ENV to development as pnpm skips dev
         // dependencies when production
@@ -74,7 +81,18 @@ export function install(
         DISABLE_OPENCOLLECTIVE: '1',
       },
     })
-    child.on('close', (code) => {
+
+    // Keep consuming both pipes while corked so installation cannot stall on
+    // buffered logs. Skip or the fatal exit path flushes the same child streams.
+    if (child.stdout) {
+      pipeWorkerOutput(child.stdout, process.stdout)
+    }
+    if (child.stderr) {
+      pipeWorkerOutput(child.stderr, process.stderr)
+    }
+
+    child.once('error', reject)
+    child.once('close', (code) => {
       if (code !== 0) {
         reject({ command: `${packageManager} ${args.join(' ')}` })
         return
