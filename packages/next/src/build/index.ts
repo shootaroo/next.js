@@ -3236,7 +3236,7 @@ export default async function build(
         const staticGenerationSpan =
           nextBuildSpan.traceChild('static-generation')
         await staticGenerationSpan.traceAsyncFn(async () => {
-          detectConflictingPaths(
+          await detectConflictingPaths(
             [
               ...combinedPages,
               ...pageKeys.pages.filter((page) => !combinedPages.includes(page)),
