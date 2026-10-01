@@ -1,3 +1,4 @@
+import { throwUpgradeError } from '../../lib/upgrade/output'
 import type { NextConfig } from '../../server/config-shared'
 import type { RouteHas } from '../../lib/load-custom-routes'
 
@@ -522,7 +523,7 @@ export function getMiddlewareMatchers(
       // We need to exit here because middleware being built occurs before we
       // finish setting up the server. Exiting here is the only way to ensure
       // that we don't hang.
-      process.exit(1)
+      throwUpgradeError('Failed to parse middleware source')
     }
 
     return {
@@ -550,7 +551,7 @@ function parseMiddlewareConfig(
     // We need to exit here because middleware being built occurs before we
     // finish setting up the server. Exiting here is the only way to ensure
     // that we don't hang.
-    process.exit(1)
+    throwUpgradeError(`${page} contains invalid middleware config`)
   }
 
   const config: ProxyConfig = {}

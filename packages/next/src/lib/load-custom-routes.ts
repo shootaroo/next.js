@@ -1,3 +1,4 @@
+import { throwUpgradeError } from './upgrade/output'
 import type { NextConfig } from '../server/config'
 import type { Token } from 'next/dist/compiled/path-to-regexp'
 
@@ -153,7 +154,7 @@ export function checkCustomRoutes(
       `Error: ${type}s must return an array, received ${typeof routes}.\n` +
         `See here for more info: https://nextjs.org/docs/messages/routes-must-be-array`
     )
-    process.exit(1)
+    throwUpgradeError(`Invalid ${type} configuration`)
   }
 
   let numInvalidRoutes = 0
@@ -483,7 +484,7 @@ export function checkCustomRoutes(
     console.error(
       `Error: Invalid ${type}${numInvalidRoutes === 1 ? '' : 's'} found`
     )
-    process.exit(1)
+    throwUpgradeError(`Invalid ${type} configuration`)
   }
 }
 
