@@ -9,6 +9,7 @@ import '../require-hook'
 
 import url from 'url'
 import path from 'path'
+import { corkUpgradeOutput, flushUpgradeOutput } from '../../lib/upgrade/output'
 import loadConfig, { type ConfiguredExperimentalFeature } from '../config'
 import { finalizeBundlerFromConfig, getBundlerFromEnv } from '../../lib/bundler'
 import { serveStatic } from '../serve-static'
@@ -181,6 +182,14 @@ export async function initialize(opts: {
     minimalMode: opts.minimalMode,
   })
 
+  // Config and headers/redirects/rewrites run with normal write callbacks.
+  // Drain their output before holding subsequent work and notifying the menu.
+  // Corking earlier could deadlock a config callback awaiting its own log write.
+  if (opts.dev && process.env.NEXT_PRIVATE_UPGRADE_PROMPT === '1') {
+    await flushUpgradeOutput()
+    corkUpgradeOutput()
+  }
+
   const renderServer: LazyRenderServerInstance = {}
 
   let development:
@@ -220,6 +229,20 @@ export async function initialize(opts: {
     // In development, it's always the complete config.
     let developmentConfig = config as NextConfigComplete
 
+    // Report a no-policy config too, so the parent can release startup logs.
+    if (
+      process.env.NEXT_PRIVATE_UPGRADE_PROMPT === '1' &&
+      process.send &&
+      !developmentConfig.experimental.agentUpgrade &&
+      !process.env.__NEXT_AGENT_UPGRADE
+    ) {
+      const { getUpgradeContext } =
+        require('../../lib/upgrade/nudge') as typeof import('../../lib/upgrade/nudge')
+      process.send({
+        nextUpgradeContext: getUpgradeContext(developmentConfig),
+      })
+    }
+
     // Check only development; production startup does not query advisories.
     if (
       developmentConfig.experimental.agentUpgrade === 'security' ||
@@ -254,27 +277,18 @@ export async function initialize(opts: {
         }
       )
       if (process.env.NEXT_PRIVATE_UPGRADE_PROMPT === '1' && process.send) {
-        // The parent retries if the worker assessment rejects.
-        const [promptAssessment] = await Promise.allSettled([assessment])
-        // TODO: Do not block dev startup while prompting for an upgrade.
-        // Preserve all logs for display after the prompt and stop dev before Update.
-        // The existing dev worker pauses here while its parent owns the menu.
-        await new Promise<void>((resolve) => {
-          const resume = (message: {
-            nextUpgradeContinue: boolean | undefined
-          }) => {
-            if (message.nextUpgradeContinue) {
-              process.off('message', resume)
-              resolve()
-            }
+        // Reuse the worker assessment without holding up dev startup. If it
+        // rejects, the parent retries while the worker reports the failure above.
+        // Send context asynchronously; do not wait for Skip before serving pages.
+        void Promise.allSettled([assessment]).then(([promptAssessment]) => {
+          if (process.connected) {
+            process.send!({
+              nextUpgradeContext: upgradeContext,
+              ...(promptAssessment.status === 'fulfilled'
+                ? { nextUpgradeAssessment: promptAssessment.value }
+                : {}),
+            })
           }
-          process.on('message', resume)
-          process.send!({
-            nextUpgradeContext: upgradeContext,
-            ...(promptAssessment.status === 'fulfilled'
-              ? { nextUpgradeAssessment: promptAssessment.value }
-              : {}),
-          })
         })
       } else {
         // CI skips the DevTools assessment, but agents still need the nudge.

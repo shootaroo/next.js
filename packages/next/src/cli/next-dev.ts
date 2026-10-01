@@ -75,6 +75,10 @@ let traceUploadUrl: string
 let sessionStopHandled = false
 let upgradeController: AbortController | null = null
 let upgradeOffered = false
+// Hold parent preflight output until the child supplies config and the menu
+// finishes. The server itself starts immediately and keeps serving throughout.
+let outputHeld = false
+let upgradeTask: Promise<void> | null = null
 let upgradeInProgress = false
 let interruption: NodeJS.Signals | null = null
 let devSpanAttrs: { 'rage-restart': boolean; 'missing-next-dir': boolean } = {
@@ -253,13 +257,30 @@ const nextDev = async (
   const { shouldPromptForUpgrade, runUpgrade, nudgeUpgrade } = await import(
     '../lib/upgrade/nudge.js'
   )
-  const humanUpgrade = await shouldPromptForUpgrade()
+  // The CLI inspect option only enables the debugger in the child, so it is
+  // not part of the parent's Node options checked by the shared prompt gate.
+  const humanUpgrade = !options.inspect && (await shouldPromptForUpgrade())
+  outputHeld = humanUpgrade
+
+  // The server can become ready before its assessment supplies a context.
+  // Keep parent preflight output behind that decision without delaying work.
+  let receivedUpgradeContext: (() => void) | null = null
+  const pendingUpgradeContext = humanUpgrade
+    ? new Promise<void>((resolve) => {
+        receivedUpgradeContext = resolve
+      })
+    : null
   const allowedUpgradeRetries = new Set<string>()
   async function offerUpgrade(
     worker: ChildProcess,
     context: UpgradeContext,
     initialAssessment: Parameters<typeof nudgeUpgrade>[4]
   ) {
+    // A buffer-limit release is permanent; a late assessment must not reopen
+    // the menu after the server has resumed writing to its terminal.
+    if (!outputHeld) {
+      return
+    }
     process.on('SIGHUP', onHangup)
     upgradeOffered = true
     upgradeInProgress = true
@@ -316,7 +337,9 @@ const nextDev = async (
       )
     }
     upgradeInProgress = false
+    outputHeld = false
     process.off('SIGHUP', onHangup)
+    // The prompt has restored the screen. Let the same server flush and continue.
     if (worker.connected) {
       worker.send({ nextUpgradeContinue: true })
     }
@@ -510,8 +533,7 @@ const nextDev = async (
           __NEXT_DEV_SERVER: '1',
           NEXT_PRIVATE_START_TIME: process.env.NEXT_PRIVATE_START_TIME,
           NEXT_PRIVATE_WORKER: '1',
-          NEXT_PRIVATE_UPGRADE_PROMPT:
-            humanUpgrade && !upgradeOffered ? '1' : undefined,
+          NEXT_PRIVATE_UPGRADE_PROMPT: outputHeld ? '1' : undefined,
           NEXT_PRIVATE_ALLOWED_UPGRADE_RETRIES: Array.from(
             allowedUpgradeRetries
           ).join(','),
@@ -541,7 +563,9 @@ const nextDev = async (
         },
       })
 
-      child.on('message', (msg: any) => {
+      // Restarts replace child; each IPC callback must keep its own worker.
+      const worker = child
+      worker.on('message', (msg: any) => {
         if (msg && typeof msg === 'object') {
           if (
             typeof msg.nextUpgradeRetryAllowed === 'string' &&
@@ -549,21 +573,37 @@ const nextDev = async (
           ) {
             allowedUpgradeRetries.add(msg.nextUpgradeRetryAllowed)
           } else if (msg.nextUpgradeContext) {
+            if (upgradeOffered) {
+              return
+            }
             const context = msg.nextUpgradeContext as UpgradeContext
             distDir = context.distDir
             const initialAssessment =
               msg.nextUpgradeAssessment !== undefined
                 ? Promise.resolve(msg.nextUpgradeAssessment)
                 : null
-            void offerUpgrade(child!, context, initialAssessment).catch(
-              async (error) => {
-                console.error(error)
-                await handleSessionStop('SIGTERM', false)
-                process.exit(1)
+            upgradeTask = offerUpgrade(
+              worker,
+              context,
+              initialAssessment
+            ).catch(async (error) => {
+              console.error(error)
+              await handleSessionStop('SIGTERM', false)
+              process.exit(1)
+            })
+            receivedUpgradeContext?.()
+          } else if (msg.nextUpgradeOutputLimit) {
+            // Close the menu first; the next turn releases logs without painting
+            // over its screen. New workers must also start with output released.
+            outputHeld = false
+            upgradeController?.abort()
+            setImmediate(() => {
+              if (worker.connected) {
+                worker.send({ nextUpgradeContinue: true })
               }
-            )
+            })
           } else if (msg.nextWorkerReady) {
-            child?.send({ nextWorkerOptions: startServerOptions })
+            worker.send({ nextWorkerOptions: startServerOptions })
           } else if (msg.nextServerReady && !resolved) {
             if (msg.port) {
               // Store the used port in case a random one was selected, so that
@@ -652,6 +692,8 @@ const nextDev = async (
         await startServer(devServerOptions)
       }
 
+      await pendingUpgradeContext
+      await upgradeTask
       await preflight(reboot)
     } catch (err) {
       console.error(err)
