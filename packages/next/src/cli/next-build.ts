@@ -21,6 +21,7 @@ import type { UpgradeContext } from '../lib/upgrade/nudge'
 import { withUpgradePromptHidden } from '../lib/upgrade/prompt'
 import {
   uncork,
+  forwardUpgradeInput,
   forwardUpgradeResize,
   handleUpgradeOutputMessages,
   isUpgradeOutputManaged,
@@ -28,7 +29,6 @@ import {
   restoreUpgradeEnvironment,
   signalUpgradeWork,
   waitForUpgradeOutput,
-  withUpgradeTemporaryOutput,
 } from '../lib/upgrade/output'
 
 export type NextBuildOptions = {
@@ -86,25 +86,18 @@ const nextBuild = async (options: NextBuildOptions, directory?: string) => {
   }
 
   process.title = `next-build (v${process.env.__NEXT_VERSION})`
-  const onTerminate = async () => {
+
+  // Every handled signal saves the profile and drains held logs before exit.
+  // Use the signal's usual status instead of repeating the same cleanup.
+  const onSignal = async (signal: NodeJS.Signals) => {
     saveCpuProfile()
     await uncork()
-    process.exit(143)
+    process.exit(128 + constants.signals[signal])
   }
-  const onInterrupt = async () => {
-    saveCpuProfile()
-    await uncork()
-    process.exit(130)
-  }
-  const onHangup = async () => {
-    saveCpuProfile()
-    await uncork()
-    process.exit(129)
-  }
-  process.on('SIGTERM', onTerminate)
-  process.on('SIGINT', onInterrupt)
+  process.on('SIGTERM', onSignal)
+  process.on('SIGINT', onSignal)
   if (isUpgradeOutputManaged()) {
-    process.on('SIGHUP', onHangup)
+    process.on('SIGHUP', onSignal)
   }
 
   const {
@@ -221,12 +214,17 @@ async function runBuildChild(
 ): Promise<never> {
   const { nudgeUpgrade, runUpgrade } = await import('../lib/upgrade/nudge.js')
   const controller = new AbortController()
-  let context: UpgradeContext | null = null
-  let upgradeEnvironment: Record<string, string | null> | null = null
+  // Retain the offer Promise after it settles so duplicate context messages
+  // cannot open another menu or start another upgrade.
   let offer: Promise<void> | null = null
   let stopped = false
   let complete = false
   let released = false
+
+  // Fatal logs can be released while the menu still owns input. Track the
+  // actual input handoff separately so spinner cleanup preserves its pipe.
+  let inputForwarded = false
+
   let upgradeResult: string | number | null = null
   let stopping: Promise<void> | null = null
   let revealing: Promise<void> | null = null
@@ -245,7 +243,10 @@ async function runBuildChild(
       spinnerInput.close()
       spinnerInput = null
       process.stdin.setRawMode(inputWasRaw)
-      if (inputWasFlowing === true) {
+
+      // readline.close() pauses stdin. After Skip it must keep feeding the
+      // worker, even when no spinner is left to read from the terminal.
+      if (inputWasFlowing === true || inputForwarded) {
         process.stdin.resume()
       } else {
         process.stdin.pause()
@@ -253,12 +254,13 @@ async function runBuildChild(
     }
   }
 
-  // Stdio remains the real terminal. Only control and config cross IPC; output
-  // stays in the work child's own corked streams, including after completion.
+  // Keep stdout/stderr as real TTYs and cork output in the child. Pipe stdin
+  // separately so plugins cannot steal menu arrows or Enter. After Skip the
+  // parent forwards input, but child stdin stays non-TTY and has no raw mode.
   // Reuse the original entry and arguments before preloads run, as well as cwd.
   // bin/next dispatches the private worker without repeating CLI initialization.
   const worker = fork(process.argv[1], process.argv.slice(2), {
-    stdio: 'inherit',
+    stdio: ['pipe', 'inherit', 'inherit', 'ipc'],
     detached: process.platform !== 'win32',
     env: {
       ...process.env,
@@ -275,6 +277,7 @@ async function runBuildChild(
   const exited = new Promise<number>((resolve) => {
     worker.once('close', (code, signal) => {
       stopped = true
+      inputForwarded = false
       stopSpinnerInput()
       resolve(
         code !== null && code >= 0
@@ -291,8 +294,29 @@ async function runBuildChild(
       worker.send({ nextUpgradeContinue: true })
     }
   }
+
+  // Interrupts and fatal errors both allow held logs to flush before close.
+  // Bound that wait, then stop any descendants left after the worker exits.
+  const waitForBuildExit = async () => {
+    const timeout = setTimeout(() => killUpgradeWork(worker), 5_000)
+    try {
+      const code = await exited
+      killUpgradeWork(worker)
+      return code
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
   const stopBuildChild = (forceKill: boolean) => {
     stopping ??= (async () => {
+      // Stop reading input into this build before shutdown or agent handoff.
+      // Worker close also unpipes its destination when work ends on its own.
+      inputForwarded = false
+      if (worker.stdin) {
+        process.stdin.unpipe(worker.stdin)
+      }
+
       // Upgrade discards this build and its logs. Confirm termination without
       // releasing output or waiting for resource cleanup before the handoff.
       if (forceKill) {
@@ -310,32 +334,18 @@ async function runBuildChild(
           interruption === 'SIGINT' ? 'SIGINT' : 'SIGTERM'
         )
       }
-      const timeout = setTimeout(() => killUpgradeWork(worker), 5_000)
-      try {
-        await exited
-        killUpgradeWork(worker)
-      } finally {
-        clearTimeout(timeout)
-      }
+      await waitForBuildExit()
     })()
     return stopping
   }
   const revealFailure = () => {
     revealing ??= withUpgradePromptHidden(async () => {
       release()
-      const timeout = setTimeout(() => killUpgradeWork(worker), 5_000)
-      try {
-        const code = await exited
-        killUpgradeWork(worker)
-        if (workError) {
-          console.error(workError)
-        } else if (code !== 0) {
-          console.error(
-            `Build stopped (${worker.signalCode ?? `exit ${code}`}).`
-          )
-        }
-      } finally {
-        clearTimeout(timeout)
+      const code = await waitForBuildExit()
+      if (workError) {
+        console.error(workError)
+      } else if (code !== 0) {
+        console.error(`Build stopped (${worker.signalCode ?? `exit ${code}`}).`)
       }
     })
     return revealing
@@ -343,6 +353,12 @@ async function runBuildChild(
 
   const onSignal = (signal: NodeJS.Signals) => {
     stopSpinnerInput()
+    // A second interrupt is the escape from slow cleanup. Upgrade can also
+    // start stopping, so require a previous interrupt before taking this path.
+    if (interruption && stopping) {
+      killUpgradeWork(worker)
+      return
+    }
     interruption ??= signal
     controller.abort()
     void stopBuildChild(false)
@@ -400,11 +416,25 @@ async function runBuildChild(
       }
     } else if (message.nextBuildComplete) {
       complete = true
-    } else if (message.nextUpgradeContext && !context) {
-      context = message.nextUpgradeContext
-      upgradeEnvironment = message.nextUpgradeEnvironment ?? null
-      const upgradeContext = context!
+    } else if (message.nextUpgradeContext && offer === null) {
+      // Only this offer uses the config snapshot, so keep it in its closure
+      // rather than adding another pair of supervisor-wide state variables.
+      const upgradeContext = message.nextUpgradeContext as UpgradeContext
+      const upgradeEnvironment: Record<string, string | null> | null =
+        message.nextUpgradeEnvironment ?? null
       offer = (async () => {
+        // Config and .env load in the build child. Restore only telemetry flags
+        // before creating the parent's recorder; restore the rest at handoff.
+        restoreUpgradeEnvironment(
+          Object.fromEntries(
+            Object.entries(upgradeEnvironment ?? {}).filter(
+              ([key]) =>
+                key === 'NEXT_TELEMETRY_DISABLED' ||
+                key === 'NEXT_TELEMETRY_DEBUG'
+            )
+          )
+        )
+
         // Record the parent's visible choice and pass its ID to the upgrade.
         // Child compilation must not create a second human nudge.
         const telemetry = new Telemetry({
@@ -429,6 +459,10 @@ async function runBuildChild(
           )
         } catch (error) {
           warn(`Could not offer the upgrade: ${String(error)}`)
+        } finally {
+          // Policy events can be recorded without showing a menu, including
+          // failed assessments. Finish this recorder before the offer settles.
+          await telemetry.flush()
         }
         if (controller.signal.aborted) {
           return
@@ -456,23 +490,39 @@ async function runBuildChild(
           }
         } else {
           release()
+
+          // Output can be released earlier to reveal an error while retaining
+          // the menu. Forward input only when this choice has actually ended.
+          if (!stopped) {
+            inputForwarded = true
+            forwardUpgradeInput(worker)
+          }
         }
       })()
-    } else if (message.nextUpgradeOutputLimit) {
-      // Buffer pressure skips the choice, not the build. Restore the prompt
-      // before granting output and keep waiting for the existing workload.
+    } else if (message.nextUpgradeSkip) {
+      // A safeguard may already be queued when Upgrade kills the build. Once
+      // shutdown starts, it must not abort the committed upgrade handoff.
+      if (stopping) {
+        return
+      }
+
+      // Memory pressure or the hold time limit skips the choice, not
+      // the build. Close the menu before releasing logs; work keeps running.
       controller.abort()
-      void withUpgradePromptHidden(async () => release()).catch((error) => {
-        console.error(error)
-        onSignal('SIGTERM')
-      })
-    } else if (message.nextUpgradeOutput === 'temporary') {
-      void withUpgradePromptHidden(() =>
-        withUpgradeTemporaryOutput(worker)
-      ).catch((error) => {
-        console.error(error)
-        onSignal('SIGTERM')
-      })
+      void withUpgradePromptHidden(async () => release())
+        .then(async () => {
+          // Menu cancellation restores stdin before it can serve the build.
+          // Never reconnect a worker already shutting down or closed.
+          await new Promise<void>(setImmediate)
+          if (!stopping && !stopped) {
+            inputForwarded = true
+            forwardUpgradeInput(worker)
+          }
+        })
+        .catch((error) => {
+          console.error(error)
+          onSignal('SIGTERM')
+        })
     } else if (message.nextUpgradeOutput) {
       void revealFailure().catch((error) => {
         console.error(error)
@@ -483,7 +533,9 @@ async function runBuildChild(
 
   try {
     const code = await exited
-    if (!stopping && !released) {
+    // A reveal may already have released logs. Finish its diagnostic before
+    // exiting, even when config failed before supplying an upgrade context.
+    if (!stopping && (!released || revealing)) {
       await revealFailure()
     }
     await offer
@@ -540,16 +592,6 @@ export function startBuildWorker() {
     }
   )
   process.send!({ nextBuildReady: true })
-}
-
-// Tests can enter the worker directly; the CLI dispatch uses the same function
-// while preserving the original invocation for preloads and user config.
-if (
-  require.main === module &&
-  process.env.NEXT_PRIVATE_UPGRADE_BUILD_WORKER === '1' &&
-  process.send
-) {
-  startBuildWorker()
 }
 
 export { nextBuild, saveCpuProfile }

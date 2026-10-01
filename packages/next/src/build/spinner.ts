@@ -19,8 +19,8 @@ export default function createSpinner(
 
   let prefixText = `${Log.prefixes.info} ${text} `
 
-  // Temporary output grants can return to the menu. Only animate and consume
-  // stdin after the final choice, with input owned by the foreground process.
+  // While the choice is pending, keep spinner writes buffered and leave menu
+  // input alone. After Skip, the foreground process owns spinner input.
   if (process.stdout.isTTY && !isUpgradeOutputPending()) {
     spinner = ora({
       text: undefined,
