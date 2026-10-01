@@ -6,7 +6,7 @@ import path from 'path'
 import { Telemetry } from '../telemetry/storage'
 import { italic } from '../lib/picocolors'
 import { warn } from '../build/output/log'
-import { printAndExit } from '../server/lib/utils'
+import { getParsedNodeOptions, printAndExit } from '../server/lib/utils'
 import isError from '../lib/is-error'
 import { getProjectDir } from '../lib/get-project-dir'
 import { enableMemoryDebuggingMode } from '../lib/memory/startup'
@@ -71,7 +71,16 @@ const nextBuild = async (options: NextBuildOptions, directory?: string) => {
   // their exception handlers out of the process that owns the upgrade menu.
   if (!isUpgradeOutputManaged()) {
     const { shouldPromptForUpgrade } = await import('../lib/upgrade/nudge.js')
-    if (await shouldPromptForUpgrade()) {
+    // Preloads already ran in this process. Forking would replay them and can
+    // collide with ports or other resources they own; keep the ordinary build.
+    const nodeOptions = getParsedNodeOptions()
+    const hasPreload =
+      nodeOptions.require !== undefined ||
+      nodeOptions.r !== undefined ||
+      nodeOptions.import !== undefined ||
+      nodeOptions.loader !== undefined ||
+      nodeOptions['experimental-loader'] !== undefined
+    if (!hasPreload && (await shouldPromptForUpgrade())) {
       return runBuildChild(options, dir)
     }
   }
