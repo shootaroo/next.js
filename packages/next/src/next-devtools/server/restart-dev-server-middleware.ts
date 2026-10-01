@@ -64,6 +64,8 @@ export function getRestartDevServerMiddleware({
     // do this async to try to give the response a chance to send
     // it's not really important if it doesn't though
     setTimeout(() => {
+      // TODO: Restarting through DevTools while the upgrade menu holds output
+      // discards buffered logs. Flush them before exiting on this path.
       process.exit(RESTART_EXIT_CODE)
     }, 0)
 

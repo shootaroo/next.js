@@ -191,7 +191,7 @@ export async function promptUpgrade({
         }
         keys.emit('keypress', '', { name: 'escape' })
       })
-    // Recreate cli-select after a resize or temporary output, retaining the
+    // Recreate cli-select after a resize or failure output, retaining the
     // selected choice. Only a user decision or cancellation ends this loop.
     while (true) {
       resized = false
@@ -211,8 +211,8 @@ export async function promptUpgrade({
       if (signal.aborted || cancelled) {
         cancel()
       }
-      // Consecutive config callbacks can request output while the previous
-      // reveal is redrawing. Deliver that request to the new selection too.
+      // Another failure or worker restart can request output while a reveal
+      // is redrawing. Deliver that request to the new selection too.
       if (pendingOutput) {
         keys.emit('keypress', '', { name: 'escape' })
       }

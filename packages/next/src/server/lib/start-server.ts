@@ -1,7 +1,4 @@
-import {
-  exitWithUpgradeOutput,
-  handleUpgradeOutputMessages,
-} from '../../lib/upgrade/output'
+import { uncork, handleUpgradeOutputMessages } from '../../lib/upgrade/output'
 // Start CPU profile if it wasn't already started.
 import './cpu-profile'
 import { getNetworkHost } from '../../lib/get-network-host'
@@ -272,7 +269,8 @@ export async function startServer(
           'memory.heapUsed': String(memoryRestartStats.used_heap_size),
         }).stop()
         flushAllTraces()
-        await exitWithUpgradeOutput(RESTART_EXIT_CODE)
+        await uncork()
+        process.exit(RESTART_EXIT_CODE)
       }
     }
   }
@@ -303,7 +301,7 @@ export async function startServer(
   let portRetryCount = 0
   const originalPort = port
 
-  server.on('error', (err: NodeJS.ErrnoException) => {
+  server.on('error', async (err: NodeJS.ErrnoException) => {
     if (
       allowRetry &&
       port &&
@@ -317,7 +315,8 @@ export async function startServer(
     } else {
       Log.error(`Failed to start server`)
       console.error(err)
-      void exitWithUpgradeOutput(1)
+      await uncork()
+      process.exit(1)
     }
   })
 
@@ -465,21 +464,25 @@ export async function startServer(
 
             debug('start-server process cleanup finished')
 
+            // Every signal exits through the same log drain. Keep each existing
+            // exit status below so shutdown never drops held diagnostics.
+            await uncork()
+
             // Exit with signal-based exit code (128 + signal number) so that
             // Node.js treats this as a signal termination, not a normal exit.
             // This avoids waiting for the debugger to disconnect.
             switch (signal) {
               case 'SIGINT':
-                await exitWithUpgradeOutput(130)
+                process.exit(130)
                 break
               case 'SIGTERM':
-                await exitWithUpgradeOutput(143)
+                process.exit(143)
                 break
               default:
                 // Make sure all handled signals have explicit exit codes.
                 // This is just a fallback to guard against unsound types.
                 signal satisfies never
-                await exitWithUpgradeOutput(128)
+                process.exit(128)
             }
           })()
         }
@@ -566,7 +569,8 @@ export async function startServer(
         // fatal error if we can't setup
         handlersError()
         console.error(err)
-        await exitWithUpgradeOutput(1)
+        await uncork()
+        process.exit(1)
       }
     })
     server.listen(port, hostname)
@@ -612,9 +616,10 @@ export async function startServer(
           filename
         )}. Restarting the server to apply the changes...`
       )
-      void exitWithUpgradeOutput(RESTART_EXIT_CODE)
+      await uncork()
+      process.exit(RESTART_EXIT_CODE)
     })
-    wp.on('remove', (removedPath: string) => {
+    wp.on('remove', async (removedPath: string) => {
       if (dirWatchPaths.includes(removedPath)) {
         Log.error(
           `The directory at "${removedPath}" was deleted.\n\n` +
@@ -623,7 +628,8 @@ export async function startServer(
             'Deleting this directory while Next.js is running can lead to ' +
             'undefined behavior. Restarting the server to recover...'
         )
-        void exitWithUpgradeOutput(RESTART_EXIT_CODE)
+        await uncork()
+        process.exit(RESTART_EXIT_CODE)
       }
     })
   }

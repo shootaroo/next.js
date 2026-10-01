@@ -1,4 +1,4 @@
-import { exitWithUpgradeOutput, withUpgradeOutput } from './upgrade/output'
+import { uncork } from './upgrade/output'
 import type { NextConfigComplete } from '../server/config-shared'
 import loadConfig from '../server/config'
 import * as Log from '../build/output/log'
@@ -69,12 +69,11 @@ export async function validateTurboNextConfig({
     )
 
     if (typeof rawNextConfig === 'function') {
-      // Validation evaluates the raw export again after initialization. Await
-      // async configs with live output, just like the original config load.
-      const configFunction = rawNextConfig as any
-      rawNextConfig = await withUpgradeOutput(async () =>
-        configFunction(configPhase, { defaultConfig })
-      )
+      // Validation can evaluate config while logs are held. The common cork
+      // deadline releases write callbacks, so config needs no separate guard.
+      rawNextConfig = await (rawNextConfig as any)(configPhase, {
+        defaultConfig,
+      })
     }
     hasWebpackConfig = Boolean(rawNextConfig.webpack)
     hasTurboConfig = Boolean(rawNextConfig.turbopack)
@@ -166,7 +165,9 @@ export async function validateTurboNextConfig({
    empty turbopack config in ${configFile} (e.g. \`turbopack: {}\`).`
     )
 
-    await exitWithUpgradeOutput(1)
+    await uncork()
+
+    process.exit(1)
   }
 
   if (unsupportedConfig.length) {

@@ -1,5 +1,5 @@
 import {
-  exitWithUpgradeOutput,
+  uncork,
   pipeWorkerOutput,
   registerUpgradeCleanup,
 } from './upgrade/output'
@@ -187,14 +187,15 @@ export class Worker {
           []) as {
           _child?: ChildProcess
         }[]) {
-          worker._child?.on('exit', (code, signal) => {
+          worker._child?.on('exit', async (code, signal) => {
             if ((code || (signal && signal !== 'SIGINT')) && this._worker) {
               logger.error(
                 `Next.js build worker exited with code: ${code} and signal: ${signal}`
               )
 
               // if a child process doesn't exit gracefully, we want to bubble up the exit code to the parent process
-              void exitWithUpgradeOutput(code ?? 1)
+              await uncork()
+              process.exit(code ?? 1)
             }
           })
 

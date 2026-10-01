@@ -1,4 +1,4 @@
-import { throwUpgradeError } from './upgrade/output'
+import { throwUpgradeError, isUpgradeFatal, uncork } from './upgrade/output'
 import type { NextConfig } from '../server/config'
 import type { Token } from 'next/dist/compiled/path-to-regexp'
 
@@ -704,11 +704,20 @@ async function loadHeaders(config: NextConfig) {
 export default async function loadCustomRoutes(
   config: NextConfig
 ): Promise<CustomRoutes> {
+  // The route checkers stay synchronous. Consume their already-reported fatal
+  // errors here, before any caller can treat invalid routes as recoverable.
   const [headers, rewrites, redirects] = await Promise.all([
     loadHeaders(config),
     loadRewrites(config),
     loadRedirects(config),
-  ])
+  ]).catch(async (error) => {
+    if (!isUpgradeFatal(error)) {
+      throw error
+    }
+
+    await uncork()
+    process.exit(1)
+  })
 
   const onMatchHeaders: Header[] = []
 

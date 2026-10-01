@@ -32,11 +32,11 @@ import type { ChildProcess } from 'child_process'
 import type { UpgradeContext } from '../lib/upgrade/nudge'
 import { withUpgradePromptHidden } from '../lib/upgrade/prompt'
 import {
+  forwardUpgradeInput,
   forwardUpgradeResize,
   killUpgradeWork,
   restoreUpgradeEnvironment,
   signalUpgradeWork,
-  withUpgradeTemporaryOutput,
 } from '../lib/upgrade/output'
 import {
   getReservedPortExplanation,
@@ -81,7 +81,6 @@ let isTurbopack: boolean
 let traceUploadUrl: string
 let sessionStopHandled = false
 let upgradeController: AbortController | null = null
-let upgradeOffered = false
 let upgradeInProgress = false
 let interruption: NodeJS.Signals | null = null
 
@@ -91,9 +90,7 @@ let outputHeld = false
 let managedDev = false
 let upgradeEnvironment: Record<string, string | null> | null = null
 
-// The server can exit before the user chooses. Retain its result while the
-// parent keeps the choice alive, then exit with that result if the user skips.
-let upgradeTask: Promise<void> | null = null
+// Retain a stopped server's result until the user chooses Skip.
 let workExitCode: number | null = null
 let devSpanAttrs: { 'rage-restart': boolean; 'missing-next-dir': boolean } = {
   'rage-restart': false,
@@ -141,6 +138,12 @@ const handleSessionStop = async (
   sessionStopHandled = true
   const interruptedUpgrade = upgradeInProgress
   upgradeController?.abort()
+
+  // Stop forwarding before shutdown or upgrade handoff. The next session
+  // must own terminal input, even while this worker is still closing.
+  if (child?.stdin) {
+    process.stdin.unpipe(child.stdin)
+  }
 
   // Upgrade discards the workload and its held output. Normal shutdown still
   // restores the menu before releasing logs and allowing graceful cleanup.
@@ -330,16 +333,16 @@ const nextDev = async (
   )
   // The CLI inspect option only enables the debugger in the child, so it is
   // not part of the parent's Node options checked by the shared prompt gate.
-  const humanUpgrade = !options.inspect && (await shouldPromptForUpgrade())
-  managedDev = humanUpgrade
-  outputHeld = humanUpgrade
+  managedDev = !options.inspect && (await shouldPromptForUpgrade())
+  outputHeld = managedDev
 
-  // The server can become ready before its assessment supplies a context.
-  // Keep parent preflight output behind that decision without delaying work.
-  let receivedUpgradeContext: (() => void) | null = null
-  const pendingUpgradeContext = humanUpgrade
+  // Create one wait before starting the child: Ready may arrive before config
+  // assessment. The first context supplies the offer Promise; parent warnings
+  // wait for that choice to finish while the child continues serving pages.
+  let finishUpgrade: ((task: Promise<void> | void) => void) | null = null
+  const upgradeDone = managedDev
     ? new Promise<void>((resolve) => {
-        receivedUpgradeContext = resolve
+        finishUpgrade = resolve
       })
     : null
 
@@ -350,6 +353,8 @@ const nextDev = async (
     process.on('SIGQUIT', onQuit)
   }
   const allowedUpgradeRetries = new Set<string>()
+  let offeredPolicy: UpgradeContext['experimental']['agentUpgrade'] | null =
+    null
   async function offerUpgrade(
     context: UpgradeContext,
     initialAssessment: Parameters<typeof nudgeUpgrade>[4]
@@ -359,7 +364,6 @@ const nextDev = async (
     if (!outputHeld) {
       return
     }
-    upgradeOffered = true
     upgradeInProgress = true
     const controller = new AbortController()
     upgradeController = controller
@@ -394,6 +398,12 @@ const nextDev = async (
     }
     if (controller.signal.aborted || sessionStopHandled) {
       upgradeInProgress = false
+
+      // Automatic Skip can finish after the worker has already closed. Its
+      // close handler leaves shutdown to the pending choice, so finish it here.
+      if (!sessionStopHandled && workExitCode !== null) {
+        await handleSessionStop(null)
+      }
       return
     }
     if (action === 'interrupt') {
@@ -423,6 +433,9 @@ const nextDev = async (
     // the child to uncork. Dev keeps serving; Skip does not restart the server.
     if (child?.connected) {
       child.send({ nextUpgradeContinue: true })
+    }
+    if (child) {
+      forwardUpgradeInput(child)
     }
     if (workExitCode !== null) {
       await handleSessionStop(null)
@@ -608,11 +621,14 @@ const nextDev = async (
       const { nodeOptions: formattedNodeOptions, execArgv } =
         formatNodeOptions(nodeOptions)
 
-      // Preserve the real terminal instead of relaying logs through the parent.
+      // Keep output on the real terminal, but isolate managed stdin so plugins
+      // cannot consume menu keys. Skip forwards input through this pipe; it
+      // stays non-TTY, so stdin raw-mode plugins cannot retain their old behavior.
+      // Ordinary dev runs keep all three inherited streams.
       // A separate POSIX group lets Upgrade kill this server and its descendants
       // without killing the CLI that must launch the upgrade next.
       child = fork(startServerPath, {
-        stdio: 'inherit',
+        stdio: managedDev ? ['pipe', 'inherit', 'inherit', 'ipc'] : 'inherit',
         detached: managedDev && process.platform !== 'win32',
         execArgv,
         env: {
@@ -656,12 +672,44 @@ const nextDev = async (
       const worker = child
       if (managedDev) {
         forwardUpgradeResize(worker)
+        // A restart after Skip has no menu to protect. Connect only this new
+        // worker; the old worker's close handler removes its own input pipe.
+        if (!outputHeld && !sessionStopHandled) {
+          forwardUpgradeInput(worker)
+        }
       }
       let workerError: Error | null = null
       let revealing: Promise<void> | null = null
       const exited = new Promise<void>((done) => {
         worker.once('close', () => done())
       })
+
+      // Permanently end the choice before releasing logs. This covers both
+      // child-requested Skip and config restarts that invalidate the old offer.
+      const skipUpgrade = () => {
+        outputHeld = false
+        upgradeController?.abort()
+        void withUpgradePromptHidden(async () => {
+          if (worker.connected) {
+            worker.send({ nextUpgradeContinue: true })
+          }
+        })
+          .then(async () => {
+            // Cancellation restores and pauses stdin as the menu settles.
+            // Start forwarding afterwards, unless this worker was replaced.
+            await new Promise<void>(setImmediate)
+            if (worker === child && !sessionStopHandled) {
+              forwardUpgradeInput(worker)
+            }
+            // Skip may arrive before assessment supplies any context. End the
+            // parent's wait too, so its warnings do not wait for a late query.
+            finishUpgrade?.()
+          })
+          .catch((error) => {
+            console.error(error)
+            void handleSessionStop('SIGTERM')
+          })
+      }
 
       // Spawn failure also emits close; IPC send errors may occur while work
       // is still alive. Neither error may tear down the independent choice.
@@ -693,6 +741,9 @@ const nextDev = async (
       worker.on('error', (error) => {
         workerError = error
         if (!managedDev) {
+          // IPC errors can arrive while the worker is still alive. Record
+          // failure before shutdown snapshots its not-yet-set exit code as 0.
+          workExitCode = 1
           console.error(error)
           void handleSessionStop('SIGTERM')
           return
@@ -703,9 +754,9 @@ const nextDev = async (
         })
       })
 
-      // Context starts the independent choice; output requests temporarily lend
-      // the terminal to the child. Ready messages continue normal dev startup.
-      // None of these waits should stop the server while the user is deciding.
+      // Context starts the independent choice. Skip permanently releases logs;
+      // fatal output hides the menu until the child closes. Ready messages keep
+      // normal dev startup moving while the user is deciding.
       worker.on('message', (msg: any) => {
         if (msg && typeof msg === 'object') {
           if (
@@ -719,50 +770,45 @@ const nextDev = async (
             upgradeEnvironment = msg.nextUpgradeEnvironment ?? null
             const context = msg.nextUpgradeContext as UpgradeContext
             distDir = context.distDir
-            if (upgradeOffered) {
+            if (offeredPolicy !== null) {
+              // A choice based on the old policy must not start an upgrade
+              // after config disables or changes it. Same-policy restarts
+              // keep the existing menu; changed policies permanently Skip.
+              if (
+                outputHeld &&
+                context.experimental.agentUpgrade !== offeredPolicy
+              ) {
+                skipUpgrade()
+              }
               return
             }
             const initialAssessment =
               msg.nextUpgradeAssessment !== undefined
                 ? Promise.resolve(msg.nextUpgradeAssessment)
                 : null
-            upgradeTask = offerUpgrade(context, initialAssessment).catch(
-              async (error) => {
+            // The policy also marks the first offer, including a disabled one.
+            // Later workers update environment or Skip instead of opening again.
+            offeredPolicy = context.experimental.agentUpgrade
+            finishUpgrade?.(
+              offerUpgrade(context, initialAssessment).catch(async (error) => {
                 console.error(error)
                 await handleSessionStop('SIGTERM', false)
                 process.exit(1)
-              }
+              })
             )
-            receivedUpgradeContext?.()
-          } else if (msg.nextUpgradeOutputLimit) {
-            // Skip the pending choice without stopping the server. Future
-            // replacement workers also start with their terminal released.
-            outputHeld = false
-            upgradeController?.abort()
-            void withUpgradePromptHidden(async () => {
-              if (worker.connected) {
-                worker.send({ nextUpgradeContinue: true })
-              }
-            }).catch((error) => {
-              console.error(error)
-              void handleSessionStop('SIGTERM')
-            })
+          } else if (msg.nextUpgradeSkip) {
+            // Memory pressure or the hold time limit ends the choice,
+            // not dev. Replacement workers also start with output released.
+            skipUpgrade()
           } else if (msg.nextUpgradeOutput) {
-            // Awaited config writes borrow the terminal and then return it.
-            // A fatal exit instead flushes and closes the worker before showing
-            // the still-pending choice again, so logs cannot overwrite it.
-            const reveal =
-              msg.nextUpgradeOutput === 'temporary'
-                ? withUpgradePromptHidden(() =>
-                    withUpgradeTemporaryOutput(worker)
-                  )
-                : revealWorkerExit()
-            void reveal.catch((error) => {
+            // Fatal output hides the menu until the worker has flushed and
+            // closed; the independent upgrade choice can then remain available.
+            void revealWorkerExit().catch((error) => {
               console.error(error)
               void handleSessionStop('SIGTERM')
             })
           } else if (msg.nextWorkerReady) {
-            if (outputHeld && upgradeOffered) {
+            if (outputHeld && offeredPolicy !== null) {
               // A replacement child loads config with live output. Hide the
               // existing choice until it has corked and reported its context.
               void withUpgradePromptHidden(
@@ -887,8 +933,7 @@ const nextDev = async (
         await startServer(devServerOptions)
       }
 
-      await pendingUpgradeContext
-      await upgradeTask
+      await upgradeDone
       await preflight(reboot)
     } catch (err) {
       console.error(err)
