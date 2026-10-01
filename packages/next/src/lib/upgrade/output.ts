@@ -170,6 +170,10 @@ export function isUpgradeOutputManaged() {
   return managed
 }
 
+export function isUpgradeOutputPending() {
+  return managed && !released
+}
+
 export function getUpgradeEnvironment(
   initialEnvironment: Record<string, string | undefined>
 ) {
@@ -259,6 +263,11 @@ export function handleUpgradeOutputMessages() {
   // entry point calls this; descendants must keep producing their own output.
   managed = true
 
+  // Replacement dev workers keep supervision after Skip, but no longer have
+  // a pending choice. Build workers use their own entry marker instead.
+  released =
+    process.env.NEXT_PRIVATE_UPGRADE_PROMPT !== '1' &&
+    process.env.NEXT_PRIVATE_UPGRADE_BUILD_WORKER !== '1'
   process.on(
     'message',
     (message: {

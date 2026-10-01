@@ -1,7 +1,7 @@
 import { yellow } from '../picocolors'
 import spawn from 'next/dist/compiled/cross-spawn'
 import type { PackageManager } from './get-pkg-manager'
-import { isUpgradeOutputManaged, pipeWorkerOutput } from '../upgrade/output'
+import { isUpgradeOutputPending, pipeWorkerOutput } from '../upgrade/output'
 
 interface InstallArgs {
   /**
@@ -60,9 +60,9 @@ export function install(
   }
 
   return new Promise<void>((resolve, reject) => {
-    // Managed installs write through the workload's streams so the prompt can
-    // stay visible. Ordinary installs keep their existing terminal behavior.
-    const captureOutput = isUpgradeOutputManaged()
+    // While the upgrade choice is pending, route logs through the held streams.
+    // New installs after Skip keep their existing terminal behavior.
+    const captureOutput = isUpgradeOutputPending()
     // Automatic installs normally need no input. Keep stdin unavailable while
     // the menu owns it; install scripts requiring input are not supported here,
     // even after Skip, since the running install keeps its original stdio.

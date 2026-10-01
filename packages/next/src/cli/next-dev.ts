@@ -127,6 +127,15 @@ const handleSessionStop = async (
   exit = true
 ) => {
   if (sessionStopHandled) {
+    // A second interrupt is an explicit escape from slow or hung cleanup.
+    // Keep the first handler responsible for telemetry and terminal restoration.
+    if (child && (signal === 'SIGINT' || signal === 'SIGTERM')) {
+      if (managedDev) {
+        killUpgradeWork(child)
+      } else {
+        child.kill('SIGKILL')
+      }
+    }
     return
   }
   sessionStopHandled = true
