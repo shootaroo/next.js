@@ -55,34 +55,41 @@ function setupProfilesDir(dir: string): void {
   }
 }
 
-if (process.env.NEXT_RSPACK) {
-  // silent rspack's schema check
-  process.env.RSPACK_CONFIG_VALIDATE = 'loose-silent'
-}
+// The supervisor already initialized the CLI. Its build child keeps the same
+// argv for preloads/config, but must not repeat warnings, timing or option hooks.
+const isBuildWorker =
+  process.env.NEXT_PRIVATE_UPGRADE_BUILD_WORKER === '1' && !!process.send
 
-if (
-  !semver.satisfies(
-    process.versions.node,
-    process.env.__NEXT_REQUIRED_NODE_VERSION_RANGE!,
-    { includePrerelease: true }
-  )
-) {
-  console.error(
-    `You are using Node.js ${process.versions.node}. For Next.js, Node.js version "${process.env.__NEXT_REQUIRED_NODE_VERSION_RANGE}" is required.`
-  )
-  process.exit(1)
-}
+if (!isBuildWorker) {
+  if (process.env.NEXT_RSPACK) {
+    // silent rspack's schema check
+    process.env.RSPACK_CONFIG_VALIDATE = 'loose-silent'
+  }
 
-process.env.NEXT_PRIVATE_START_TIME = Date.now().toString()
-
-for (const dependency of ['react', 'react-dom']) {
-  try {
-    // When 'npm link' is used it checks the clone location. Not the project.
-    require.resolve(dependency)
-  } catch (err) {
-    console.warn(
-      `The module '${dependency}' was not found. Next.js requires that you include it in 'dependencies' of your 'package.json'. To add it, run 'npm install ${dependency}'`
+  if (
+    !semver.satisfies(
+      process.versions.node,
+      process.env.__NEXT_REQUIRED_NODE_VERSION_RANGE!,
+      { includePrerelease: true }
     )
+  ) {
+    console.error(
+      `You are using Node.js ${process.versions.node}. For Next.js, Node.js version "${process.env.__NEXT_REQUIRED_NODE_VERSION_RANGE}" is required.`
+    )
+    process.exit(1)
+  }
+
+  process.env.NEXT_PRIVATE_START_TIME = Date.now().toString()
+
+  for (const dependency of ['react', 'react-dom']) {
+    try {
+      // When 'npm link' is used it checks the clone location. Not the project.
+      require.resolve(dependency)
+    } catch (err) {
+      console.warn(
+        `The module '${dependency}' was not found. Next.js requires that you include it in 'dependencies' of your 'package.json'. To add it, run 'npm install ${dependency}'`
+      )
+    }
   }
 }
 
@@ -851,4 +858,12 @@ internal
   )
   .usage('[directory] [options]')
 
-program.parse(process.argv)
+// Dispatch workers without parsing again: flags have already configured the
+// environment, including profiling/tracing, and parsed build options use IPC.
+if (isBuildWorker) {
+  const { startBuildWorker } =
+    require('../cli/next-build') as typeof import('../cli/next-build')
+  startBuildWorker()
+} else {
+  program.parse(process.argv)
+}

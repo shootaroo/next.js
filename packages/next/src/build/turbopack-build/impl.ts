@@ -1,4 +1,5 @@
 import path from 'path'
+import { registerUpgradeCleanup } from '../../lib/upgrade/output'
 import { validateTurboNextConfig } from '../../lib/turbopack-warning'
 import { seedTurbopackCacheIfNeeded } from '../../lib/turbopack-cache-seed'
 import { NextBuildContext } from '../build-context'
@@ -152,19 +153,27 @@ export async function turbopackBuild(telemetry: Telemetry): Promise<{
     parentSpan: NextBuildContext.nextBuildSpan,
     signal: shutdownController.signal,
   })
-  const runShutdown = async () => {
-    await project.shutdown()
-    // Shutdown flushes and closes the compilation event queue, so the
-    // subscription ends once final events (e.g. persistence, compaction trace
-    // spans) have been delivered. The timeout is only a backstop against a
-    // subscription that never closes.
-    await Promise.race([
-      compilationEvents,
-      new Promise((resolve) => setTimeout(resolve, 10_000).unref()),
-    ])
-    shutdownController.abort()
-    await compilationEvents
+  let shutdown: Promise<void> | null = null
+  const runShutdown = () => {
+    // Compilation completion and a terminal interruption can race. Finish
+    // native delivery and the JS event subscription once, before flushing the
+    // child's streams and handing the terminal to an upgrade.
+    shutdown ??= (async () => {
+      try {
+        await project.shutdown()
+        await Promise.race([
+          compilationEvents,
+          new Promise((resolve) => setTimeout(resolve, 10_000).unref()),
+        ])
+      } finally {
+        shutdownController.abort()
+        unregister()
+        await compilationEvents
+      }
+    })()
+    return shutdown
   }
+  const unregister = registerUpgradeCleanup(runShutdown)
 
   try {
     printBuildErrors(projectResult, dev)

@@ -1,3 +1,7 @@
+import {
+  isUpgradeOutputManaged,
+  isUpgradeOutputPending,
+} from '../lib/upgrade/output'
 import ora from 'next/dist/compiled/ora'
 import * as Log from './output/log'
 
@@ -15,22 +19,44 @@ export default function createSpinner(
 
   let prefixText = `${Log.prefixes.info} ${text} `
 
-  if (process.stdout.isTTY) {
+  // Temporary output grants can return to the menu. Only animate and consume
+  // stdin after the final choice, with input owned by the foreground process.
+  if (process.stdout.isTTY && !isUpgradeOutputPending()) {
     spinner = ora({
       text: undefined,
       prefixText,
       spinner: dotsSpinner,
       stream: process.stdout,
       ...options,
-    }).start() as ora.Ora & { setText: (text: string) => void }
+      discardStdin: !isUpgradeOutputManaged(),
+    }) as ora.Ora & { setText: (text: string) => void }
 
     // Add capturing of console.log/warn/error to allow pausing
     // the spinner before logging and then restarting spinner after
     const origLog = console.log
     const origWarn = console.warn
     const origError = console.error
+    const origStart = spinner.start.bind(spinner)
     const origStop = spinner.stop.bind(spinner)
     const origStopAndPersist = spinner.stopAndPersist.bind(spinner)
+
+    // Tell the foreground process when to discard input. Track each spinner
+    // separately so overlapping spinners and repeated stops stay balanced.
+    let ownsInput = false
+    const setInput = (active: boolean) => {
+      if (ownsInput === active || !isUpgradeOutputManaged()) {
+        return
+      }
+      ownsInput = active
+      if (process.connected) {
+        process.send?.({ nextBuildSpinner: active ? 1 : -1 })
+      }
+    }
+    spinner.start = (spinnerText) => {
+      const result = origStart(spinnerText)
+      setInput(result.isSpinning)
+      return result
+    }
 
     const logHandle = (method: any, args: any[]) => {
       // Enter a new line before logging new message, to avoid
@@ -42,6 +68,7 @@ export default function createSpinner(
         spinner.text = '\r'
         spinner.clear()
         origStop()
+        setInput(false)
       }
       method(...args)
       if (spinner && isInProgress) {
@@ -66,6 +93,7 @@ export default function createSpinner(
     }
     spinner.stop = () => {
       origStop()
+      setInput(false)
       resetLog()
       return spinner!
     }
@@ -78,9 +106,11 @@ export default function createSpinner(
         logFn(suffixText)
       }
       origStopAndPersist()
+      setInput(false)
       resetLog()
       return spinner!
     }
+    spinner.start()
   } else if (prefixText || text) {
     logFn(prefixText ? prefixText + '...' : text)
   }
