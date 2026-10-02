@@ -294,11 +294,27 @@ program
   .option('--experimental-app-only', 'Analyzes only App Router routes.')
   .option(
     '--snapshot-name <name>',
-    'Name this snapshot in the metadata, overriding branch/sha in the comparison UI.'
+    'Name a new snapshot or select a uniquely named saved snapshot with --export-graph.'
   )
   .option(
     '-o, --output',
-    'Only write analysis files to disk. Does not start the server.'
+    'Write binary analysis data and UI files, save a snapshot, and exit without serving.'
+  )
+  .option(
+    '--export-graph',
+    'Stream a saved analyzer graph as NDJSON without building (defaults to latest; use --snapshot or --snapshot-name to select another).'
+  )
+  .option(
+    '--snapshot <id>',
+    'Select a saved snapshot by ID (requires --export-graph).'
+  )
+  .option(
+    '--route <route>',
+    'Filter graph records to a route (requires --export-graph).'
+  )
+  .option(
+    '--dist-dir <directory>',
+    'Replay from a custom relative build directory (requires --export-graph).'
   )
   .addOption(
     new Option(
@@ -310,17 +326,37 @@ program
       .default(4000)
       .env('PORT')
   )
-  .action((directory: string, options: NextAnalyzeOptions) => {
-    return import('../cli/next-analyze.js')
-      .then((mod) => mod.nextAnalyze(options, directory))
-      .then(() => {
-        if (options.output) {
-          // The Next.js process is held open by something on the event loop. Exit manually like the `build` command does.
-          // TODO: Fix the underlying issue so this is not necessary.
-          process.exit(0)
-        }
-      })
-  })
+  .action(
+    (directory: string, options: NextAnalyzeOptions, command: Command) => {
+      // PORT is for the interactive server. It must not turn replay into a
+      // server invocation just because the environment sets it.
+      if (
+        options.exportGraph &&
+        command.getOptionValueSource('port') === 'env'
+      ) {
+        options.serve = false
+      }
+      const { nextAnalyze } =
+        require('../cli/next-analyze.js') as typeof import('../cli/next-analyze.js')
+      return nextAnalyze(options, directory)
+        .then(() => {
+          if (options.exportGraph) {
+            // WriteRecord awaits stream backpressure, but stdout may still have
+            // buffered bytes after the last write. The process has open handles,
+            // so drain stdout before the explicit exit instead of losing records.
+            process.stdout.end(() => process.exit(0))
+          } else if (options.output) {
+            // The Next.js process is held open by something on the event loop. Exit manually like the `build` command does.
+            // TODO: Fix the underlying issue so this is not necessary.
+            process.exit(0)
+          }
+        })
+        .catch((error) => {
+          console.error(error)
+          process.exit(1)
+        })
+    }
+  )
 
 program
   .command('dev', { isDefault: true })
