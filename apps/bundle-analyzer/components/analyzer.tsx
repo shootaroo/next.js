@@ -98,6 +98,29 @@ function AnalyzerFallback({ view }: { view: CompareView }) {
   return <AnalyzerChromeSkeleton view={view} />
 }
 
+// Keep graph derivation separate so React Compiler can cache it independently
+// of the stateful analyzer model.
+function useModuleGraph(
+  modulesData: ModulesData,
+  analyzeData: AnalyzeData | undefined
+) {
+  'use memo'
+
+  if (!analyzeData) {
+    return { moduleDepthMap: new Map(), sourceLoadScopes: new Map() }
+  }
+
+  const activeEntries = computeActiveEntries(modulesData, analyzeData)
+  return {
+    moduleDepthMap: computeModuleDepthMap(modulesData, activeEntries),
+    sourceLoadScopes: computeSourceLoadScopes(
+      modulesData,
+      analyzeData,
+      activeEntries
+    ),
+  }
+}
+
 function useAnalyzerModel(compare: boolean) {
   const [routePickerOpen, setRoutePickerOpen] = useState(false)
   const [selectedSourceIndex, setSelectedSourceIndex] = useState<number | null>(
@@ -227,23 +250,10 @@ function useAnalyzerModel(compare: boolean) {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [analyzeData])
 
-  // React Compiler currently skips this hook. Keep the graph traversal cached
-  // across selection and filter updates until that bailout is resolved.
-  const { moduleDepthMap, sourceLoadScopes } = useMemo(() => {
-    if (!analyzeData) {
-      return { moduleDepthMap: new Map(), sourceLoadScopes: new Map() }
-    }
-
-    const activeEntries = computeActiveEntries(modulesData, analyzeData)
-    return {
-      moduleDepthMap: computeModuleDepthMap(modulesData, activeEntries),
-      sourceLoadScopes: computeSourceLoadScopes(
-        modulesData,
-        analyzeData,
-        activeEntries
-      ),
-    }
-  }, [modulesData, analyzeData])
+  const { moduleDepthMap, sourceLoadScopes } = useModuleGraph(
+    modulesData,
+    analyzeData
+  )
 
   // This hook isn't compiled; stable predicate identity keeps the source diff
   // and treemap layout below cached.
